@@ -10,7 +10,7 @@ use rustc_next_trait_solver::{
 use rustc_type_ir::{
     Interner, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
     inherent::IntoKind,
-    solve::{Certainty, NoSolution},
+    solve::{Certainty, MaybeCause, MaybeInfo, NoSolution},
 };
 
 use crate::{
@@ -42,6 +42,9 @@ type PendingObligations<'db> =
 #[derive(Debug)]
 pub struct FulfillmentCtxt<'db> {
     obligations: ObligationStorage<'db>,
+
+    /// A deeper search could resolve an obligation that was left ambiguous.
+    pub(crate) encountered_depth_overflow: bool,
 
     /// The snapshot in which this context was created. Using the context
     /// outside of this snapshot leads to subtle bugs if the snapshot
@@ -115,6 +118,7 @@ impl<'db> FulfillmentCtxt<'db> {
     pub fn new(infcx: &InferCtxt<'db>) -> FulfillmentCtxt<'db> {
         FulfillmentCtxt {
             obligations: Default::default(),
+            encountered_depth_overflow: false,
             usable_in_snapshot: infcx.num_open_snapshots(),
             try_evaluate_obligations_scratch: Default::default(),
         }
@@ -197,6 +201,14 @@ impl<'db> FulfillmentCtxt<'db> {
                         continue;
                     }
                 };
+
+                self.encountered_depth_overflow |= matches!(
+                    certainty,
+                    Certainty::Maybe(MaybeInfo {
+                        cause: MaybeCause::Overflow { suggest_increasing_limit: true, .. },
+                        ..
+                    })
+                );
 
                 if has_changed == HasChanged::Yes {
                     // We increment the recursion depth here to track the number of times

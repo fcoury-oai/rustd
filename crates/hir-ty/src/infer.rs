@@ -64,7 +64,7 @@ use rustc_abi::TargetDataLayout;
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
-    AliasTyKind, TypeFoldable, TypeVisitableExt,
+    AliasTyKind, Interner as _, TypeFoldable, TypeVisitableExt,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
 };
 use salsa::SalsaValue;
@@ -126,61 +126,64 @@ pub fn infer_query_with_inspect<'db>(
     inspect: Option<ObligationInspector<'db>>,
     lowering_mode: LoweringMode,
 ) -> InferenceResult<'db> {
-    let _p = tracing::info_span!("infer_query").entered();
-    let resolver = def.resolver(db);
-    let body = Body::of(db, def);
-    let mut ctx = InferenceContext::new(
-        db,
-        InferBodyId::DefWithBodyId(def),
-        ExpressionStoreOwnerId::Body(def),
-        def.generic_def(db),
-        &body.store,
-        resolver,
-        true,
-        lowering_mode,
-    );
+    infer_with_retries(|recursion_limit| {
+        let _p = tracing::info_span!("infer_query").entered();
+        let resolver = def.resolver(db);
+        let body = Body::of(db, def);
+        let mut ctx = InferenceContext::new(
+            db,
+            InferBodyId::DefWithBodyId(def),
+            ExpressionStoreOwnerId::Body(def),
+            def.generic_def(db),
+            &body.store,
+            resolver,
+            true,
+            lowering_mode,
+            recursion_limit,
+        );
 
-    if let Some(inspect) = inspect {
-        ctx.table.infer_ctxt.attach_obligation_inspector(inspect);
-    }
-
-    match def {
-        DefWithBodyId::FunctionId(f) => {
-            ctx.collect_fn(f, body.self_param.map(|param| param.formal), &body.params)
+        if let Some(inspect) = inspect {
+            ctx.table.infer_ctxt.attach_obligation_inspector(inspect);
         }
-        DefWithBodyId::ConstId(c) => ctx.collect_const_or_static(c.into()),
-        DefWithBodyId::StaticId(s) => ctx.collect_const_or_static(s.into()),
-        DefWithBodyId::VariantId(v) => {
-            ctx.return_ty = match EnumSignature::variant_body_type(db, v.lookup(db).parent) {
-                hir_def::layout::IntegerType::Pointer(signed) => match signed {
-                    true => ctx.types.types.isize,
-                    false => ctx.types.types.usize,
-                },
-                hir_def::layout::IntegerType::Fixed(size, signed) => match signed {
-                    true => match size {
-                        Integer::I8 => ctx.types.types.i8,
-                        Integer::I16 => ctx.types.types.i16,
-                        Integer::I32 => ctx.types.types.i32,
-                        Integer::I64 => ctx.types.types.i64,
-                        Integer::I128 => ctx.types.types.i128,
+
+        match def {
+            DefWithBodyId::FunctionId(f) => {
+                ctx.collect_fn(f, body.self_param.map(|param| param.formal), &body.params)
+            }
+            DefWithBodyId::ConstId(c) => ctx.collect_const_or_static(c.into()),
+            DefWithBodyId::StaticId(s) => ctx.collect_const_or_static(s.into()),
+            DefWithBodyId::VariantId(v) => {
+                ctx.return_ty = match EnumSignature::variant_body_type(db, v.lookup(db).parent) {
+                    hir_def::layout::IntegerType::Pointer(signed) => match signed {
+                        true => ctx.types.types.isize,
+                        false => ctx.types.types.usize,
                     },
-                    false => match size {
-                        Integer::I8 => ctx.types.types.u8,
-                        Integer::I16 => ctx.types.types.u16,
-                        Integer::I32 => ctx.types.types.u32,
-                        Integer::I64 => ctx.types.types.u64,
-                        Integer::I128 => ctx.types.types.u128,
+                    hir_def::layout::IntegerType::Fixed(size, signed) => match signed {
+                        true => match size {
+                            Integer::I8 => ctx.types.types.i8,
+                            Integer::I16 => ctx.types.types.i16,
+                            Integer::I32 => ctx.types.types.i32,
+                            Integer::I64 => ctx.types.types.i64,
+                            Integer::I128 => ctx.types.types.i128,
+                        },
+                        false => match size {
+                            Integer::I8 => ctx.types.types.u8,
+                            Integer::I16 => ctx.types.types.u16,
+                            Integer::I32 => ctx.types.types.u32,
+                            Integer::I64 => ctx.types.types.u64,
+                            Integer::I128 => ctx.types.types.u128,
+                        },
                     },
-                },
-            };
+                };
+            }
         }
-    }
 
-    ctx.infer_body(body.root_expr());
+        ctx.infer_body(body.root_expr());
 
-    ctx.infer_mut_body(body.root_expr());
+        ctx.infer_mut_body(body.root_expr());
 
-    infer_finalize(ctx)
+        infer_finalize(ctx)
+    })
 }
 
 fn infer_cycle_result<'db>(
@@ -199,31 +202,34 @@ fn infer_anon_const_query<'db>(
     db: &'db dyn HirDatabase,
     def: AnonConstId<'db>,
 ) -> InferenceResult<'db> {
-    let _p = tracing::info_span!("infer_anon_const_query").entered();
-    let loc = def.loc(db);
-    let store_owner = loc.owner;
-    let store = ExpressionStore::of(db, store_owner);
+    infer_with_retries(|recursion_limit| {
+        let _p = tracing::info_span!("infer_anon_const_query").entered();
+        let loc = def.loc(db);
+        let store_owner = loc.owner;
+        let store = ExpressionStore::of(db, store_owner);
 
-    let resolver = store_owner.resolver(db);
+        let resolver = store_owner.resolver(db);
 
-    let mut ctx = InferenceContext::new(
-        db,
-        InferBodyId::AnonConstId(def),
-        store_owner,
-        loc.owner.generic_def(db),
-        store,
-        resolver,
-        loc.allow_using_generic_params,
-        LoweringMode::Analysis,
-    );
+        let mut ctx = InferenceContext::new(
+            db,
+            InferBodyId::AnonConstId(def),
+            store_owner,
+            loc.owner.generic_def(db),
+            store,
+            resolver,
+            loc.allow_using_generic_params,
+            LoweringMode::Analysis,
+            recursion_limit,
+        );
 
-    ctx.infer_expr(
-        loc.expr,
-        &Expectation::has_type(loc.ty.get().instantiate_identity().skip_norm_wip()),
-        ExprIsRead::Yes,
-    );
+        ctx.infer_expr(
+            loc.expr,
+            &Expectation::has_type(loc.ty.get().instantiate_identity().skip_norm_wip()),
+            ExprIsRead::Yes,
+        );
 
-    infer_finalize(ctx)
+        infer_finalize(ctx)
+    })
 }
 
 fn infer_anon_const_cycle_result<'db>(
@@ -237,7 +243,25 @@ fn infer_anon_const_cycle_result<'db>(
     }
 }
 
-fn infer_finalize<'db>(mut ctx: InferenceContext<'db>) -> InferenceResult<'db> {
+/// Retry only failed inference that encountered a solver depth limit. A fresh context avoids
+/// retaining fallback types, closure captures or diagnostics from the incomplete attempt.
+/// Two retries bound the extra work and allow at most four times the crate's solver depth.
+fn infer_with_retries<'db>(
+    mut infer: impl FnMut(Option<u32>) -> (InferenceResult<'db>, Option<u32>),
+) -> InferenceResult<'db> {
+    let mut recursion_limit = None;
+    let mut retries = 2;
+    loop {
+        let (result, next_limit) = infer(recursion_limit);
+        if retries == 0 || next_limit.is_none() {
+            return result;
+        }
+        recursion_limit = next_limit;
+        retries -= 1;
+    }
+}
+
+fn infer_finalize<'db>(mut ctx: InferenceContext<'db>) -> (InferenceResult<'db>, Option<u32>) {
     ctx.handle_opaque_type_uses();
 
     ctx.type_inference_fallback();
@@ -265,7 +289,16 @@ fn infer_finalize<'db>(mut ctx: InferenceContext<'db>) -> InferenceResult<'db> {
 
     ctx.merge_anon_consts();
 
-    ctx.resolve_all()
+    // Debug builds retain the interner's smaller limit to avoid overflowing their stacks.
+    let next_limit =
+        if ctx.table.fulfillment_cx.encountered_depth_overflow && !cfg!(debug_assertions) {
+            (ctx.interner().recursion_limit() as u32).checked_mul(2)
+        } else {
+            None
+        };
+    let result = ctx.resolve_all();
+    let next_limit = next_limit.filter(|_| result.has_errors);
+    (result, next_limit)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1438,9 +1471,13 @@ impl<'db> InferenceContext<'db> {
         resolver: Resolver<'db>,
         allow_using_generic_params: bool,
         lowering_mode: LoweringMode,
+        recursion_limit: Option<u32>,
     ) -> Self {
         let trait_env = db.trait_environment(generic_def);
-        let table = unify::InferenceTable::new(db, trait_env, resolver.krate(), owner);
+        let mut table = unify::InferenceTable::new(db, trait_env, resolver.krate(), owner);
+        if let Some(limit) = recursion_limit {
+            table.infer_ctxt.interner = table.interner().with_recursion_limit(limit);
+        }
         let types = crate::next_solver::default_types();
         InferenceContext {
             result: InferenceResult::new(types.types.error),
