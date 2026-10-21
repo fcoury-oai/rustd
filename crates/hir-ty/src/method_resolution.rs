@@ -32,10 +32,12 @@ use hir_def::{
     unstable_features::UnstableFeatures,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_next_trait_solver::solve::{GoalEvaluation, SolverDelegateEvalExt};
 use rustc_type_ir::{
-    TypeFoldable, TypeVisitableExt, VisitorResult,
+    Interner as _, TypeFoldable, TypeVisitableExt, VisitorResult,
     fast_reject::{TreatParams, simplify_type},
     inherent::{BoundExistentialPredicates, IntoKind},
+    solve::{Certainty, Goal, MaybeCause, MaybeInfo},
     try_visit,
 };
 use stdx::impl_from;
@@ -49,7 +51,7 @@ use crate::{
     lower::GenericPredicates,
     next_solver::{
         AnyImplId, Binder, ClauseKind, DbInterner, FnSig, GenericArgs, ParamEnv, PredicateKind,
-        SimplifiedType, SolverDefId, TraitRef, Ty, TyKind, TypingMode, Unnormalized,
+        SimplifiedType, SolverContext, SolverDefId, TraitRef, Ty, TyKind, TypingMode, Unnormalized,
         infer::{
             BoundRegionConversionTime, DbInternerInferExt, InferCtxt, InferOk,
             resolve::ReplaceInferWithError,
@@ -422,12 +424,10 @@ pub(crate) fn lookup_impl_method_query<'db>(
     func: FunctionId,
     fn_subst: GenericArgs<'db>,
 ) -> (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>) {
-    let interner = DbInterner::new_with(db, env.krate);
-    let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-
     let ItemContainerId::TraitId(trait_id) = func.loc(db).container else {
         return (Either::Left(func), fn_subst);
     };
+    let mut interner = DbInterner::new_with(db, env.krate);
     let trait_params = GenericParams::of(db, trait_id.into()).len();
     let trait_ref = TraitRef::new_from_args(
         interner,
@@ -436,25 +436,56 @@ pub(crate) fn lookup_impl_method_query<'db>(
     );
 
     let name = &FunctionSignature::of(db, func).name;
-    let Some((impl_fn, impl_subst)) =
-        lookup_impl_assoc_item_for_trait_ref(&infcx, trait_ref, env.param_env, name).and_then(
-            |(assoc, impl_args)| {
-                let assoc = match assoc {
-                    Either::Left(AssocItemId::FunctionId(id)) => Either::Left(id),
-                    Either::Right(it) => Either::Right(it),
-                    _ => return None,
-                };
-                Some((assoc, impl_args))
-            },
-        )
-    else {
-        return (Either::Left(func), fn_subst);
-    };
+    for attempt in 0..=2 {
+        let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        if let Some((impl_fn, impl_subst)) =
+            lookup_impl_assoc_item_for_trait_ref(&infcx, trait_ref, env.param_env, name).and_then(
+                |(assoc, impl_args)| {
+                    let assoc = match assoc {
+                        Either::Left(AssocItemId::FunctionId(id)) => Either::Left(id),
+                        Either::Right(it) => Either::Right(it),
+                        _ => return None,
+                    };
+                    Some((assoc, impl_args))
+                },
+            )
+        {
+            return (
+                impl_fn,
+                GenericArgs::new_from_iter(
+                    impl_subst.iter().chain(fn_subst.iter().skip(trait_params)),
+                ),
+            );
+        }
 
-    (
-        impl_fn,
-        GenericArgs::new_from_iter(impl_subst.iter().chain(fn_subst.iter().skip(trait_params))),
-    )
+        // Inference can succeed while selecting the concrete implementation later exhausts
+        // the solver depth. Retry only that ambiguity, with the same bounded budget as inference.
+        if attempt == 2 || cfg!(debug_assertions) {
+            break;
+        }
+        let result = <&SolverContext<'db>>::from(&infcx).evaluate_root_goal(
+            Goal::new(interner, env.param_env, trait_ref),
+            Span::Dummy,
+            None,
+        );
+        if !matches!(
+            result,
+            Ok(GoalEvaluation {
+                certainty: Certainty::Maybe(MaybeInfo {
+                    cause: MaybeCause::Overflow { suggest_increasing_limit: true, .. },
+                    ..
+                }),
+                ..
+            })
+        ) {
+            break;
+        }
+        let Some(limit) = (interner.recursion_limit() as u32).checked_mul(2) else {
+            break;
+        };
+        interner = interner.with_recursion_limit(limit);
+    }
+    (Either::Left(func), fn_subst)
 }
 
 fn lookup_impl_assoc_item_for_trait_ref<'db>(

@@ -407,7 +407,7 @@ impl<'db> DbInterner<'db> {
         }
     }
 
-    /// Starts a fresh solver cache for another inference attempt with a deeper search.
+    /// Starts a fresh solver cache for another attempt with a deeper search.
     pub(crate) fn with_recursion_limit(mut self, limit: u32) -> Self {
         self.recursion_limit = limit;
         self.solved = tls_cache::Solved::new();
