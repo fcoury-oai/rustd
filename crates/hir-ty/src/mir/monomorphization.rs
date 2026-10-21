@@ -10,7 +10,8 @@
 use rustc_next_trait_solver::placeholder::BoundVarReplacer;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use rustc_type_ir::{
-    FallibleTypeFolder, TypeFlags, TypeFoldable, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
+    FallibleTypeFolder, Interner as _, TypeFlags, TypeFoldable, TypeSuperFoldable,
+    TypeVisitableExt, UniverseIndex,
 };
 
 use crate::{
@@ -40,6 +41,8 @@ struct Filler<'db> {
     subst: GenericArgs<'db>,
     /// One entry for each binder the fold is inside of, as normalization wants them.
     universes: Vec<Option<UniverseIndex>>,
+    /// Opaques being revealed, so a recursive hidden type is refused rather than recursed into.
+    opaques: Vec<Ty<'db>>,
 }
 
 impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
@@ -69,6 +72,34 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                 // First instantiate params.
                 let ty = ty.try_super_fold_with(self)?;
                 let ty = self.impl_opaque(ty);
+
+                // A forwarding impl can hide another trait method's opaque return type.
+                // Reveal one layer at a time so each one is resolved to its implementing
+                // method before the solver tries to normalize a trait declaration with no body.
+                if let TyKind::Alias(alias @ AliasTy { kind: AliasTyKind::Opaque { def_id }, .. }) =
+                    ty.kind()
+                {
+                    if self.opaques.contains(&ty) {
+                        return Err(MirLowerError::NotSupported(
+                            "recursive opaque type".to_owned(),
+                        ));
+                    }
+                    if self.opaques.len() >= self.infcx.interner.recursion_limit() {
+                        return Err(MirLowerError::NotSupported(
+                            "opaque type normalization exceeds recursion limit".to_owned(),
+                        ));
+                    }
+                    let hidden = self
+                        .infcx
+                        .interner
+                        .type_of_opaque_hir_typeck(def_id)
+                        .instantiate(self.infcx.interner, alias.args)
+                        .skip_norm_wip();
+                    self.opaques.push(ty);
+                    let result = self.try_fold_ty(hidden);
+                    self.opaques.pop();
+                    return result;
+                }
 
                 let ty = self.normalized(ty)?;
                 // Normalization could introduce infer vars (for example, if the alias cannot be normalized),
@@ -145,7 +176,7 @@ impl<'db> Filler<'db> {
     fn new(db: &'db dyn HirDatabase, env: ParamEnvAndCrate<'db>, subst: GenericArgs<'db>) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-        Self { infcx, trait_env: env, subst, universes: Vec::new() }
+        Self { infcx, trait_env: env, subst, universes: Vec::new(), opaques: Vec::new() }
     }
 
     /// The `impl Trait` a trait method returns is the one of the impl's method once the
